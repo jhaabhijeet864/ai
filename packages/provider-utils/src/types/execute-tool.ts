@@ -32,16 +32,34 @@ export async function* executeTool<TOOL extends Tool>({
   | { type: 'preliminary'; output: InferToolOutput<TOOL> }
   | { type: 'final', output: InferToolOutput<TOOL> }
 > {
-  const result = tool.execute(input, options);
+  const resultPromise = tool.execute(input, options);
 
-  if (isAsyncIterable(result)) {
+  // Create a safe, leak-free abort wrapper to prevent zombie executions
+  const safeResult = await Promise.race([
+    resultPromise,
+    new Promise((_, reject) => {
+      if (options.abortSignal?.aborted) {
+        return reject(options.abortSignal.reason);
+      }
+
+      const abortHandler = () => reject(options.abortSignal.reason);
+      options.abortSignal?.addEventListener('abort', abortHandler, { once: true });
+
+      // Ensure the listener is removed if the tool finishes successfully before an abort
+      resultPromise.finally(() => {
+        options.abortSignal?.removeEventListener('abort', abortHandler);
+      }).catch(() => {});
+    }),
+  ]);
+
+  if (isAsyncIterable(safeResult)) {
     let lastOutput: InferToolOutput<TOOL> | undefined;
-    for await (const output of result) {
+    for await (const output of safeResult) {
       lastOutput = output;
       yield { type: 'preliminary', output };
     }
     yield { type: 'final', output: lastOutput! };
   } else {
-    yield { type: 'final', output: await result };
+    yield { type: 'final', output: safeResult };
   }
 }
