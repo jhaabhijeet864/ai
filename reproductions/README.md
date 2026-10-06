@@ -12,7 +12,7 @@ When the SDK executes a tool, it merges the client's `AbortSignal` with a config
 However, the SDK delegates the actual cancellation enforcement entirely to the developer's implementation. In `packages/provider-utils/src/types/execute-tool.ts`, the SDK yields the tool's result without a framework-level circuit breaker:
 
 ```typescript
-// packages/provider-utils/src/types/execute-tool.ts (approx line 45)
+// packages/provider-utils/src/types/execute-tool.ts
 const result = tool.execute(input, options);
 // ...
 yield { type: 'final', output: await result }; // <-- BLOCKS INDEFINITELY
