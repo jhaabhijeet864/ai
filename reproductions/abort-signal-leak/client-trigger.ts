@@ -2,6 +2,17 @@ import { streamText } from 'ai';
 import { openai } from '@ai-sdk/openai'; // Assuming OpenAI, but can be any model
 import { zombieTool } from './zombie-tool';
 
+function logMemorySnapshot(label: string) {
+  const mem = process.memoryUsage();
+  const toMB = (bytes: number) => (bytes / 1024 / 1024).toFixed(2);
+
+  console.log(`[Memory - ${label}]`);
+  console.log(`  Heap Used:  ${toMB(mem.heapUsed)} MB`);
+  console.log(`  Heap Total: ${toMB(mem.heapTotal)} MB`);
+  console.log(`  RSS:        ${toMB(mem.rss)} MB`);
+  console.log(`  External:   ${toMB(mem.external)} MB`);
+}
+
 async function runReproduction() {
   const ITERATIONS = 500;
   console.log(`Starting reproduction: ${ITERATIONS} iterations of aborted zombie tool calls...`);
@@ -26,8 +37,7 @@ async function runReproduction() {
       controller.abort();
 
       if (i % 50 === 0) {
-        const mem = process.memoryUsage();
-        console.log(`Iteration ${i}: RSS = ${Math.round(mem.rss / 1024 / 1024)} MB`);
+        logMemorySnapshot(`Iteration ${i}`);
       }
     } catch (e) {
       // Abort errors are expected
@@ -35,6 +45,7 @@ async function runReproduction() {
   }
 
   console.log('Completed iterations. If the server is still running, check memory usage.');
+  logMemorySnapshot('Final');
 }
 
 runReproduction().catch(console.error);
