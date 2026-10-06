@@ -1,0 +1,16 @@
+{
+  "name": "typesafe-ssrf-poc",
+  "version": "1.0.0",
+  "description": "PoC for SSRF via baseURL in TypeSafe Provider",
+  "scripts": {
+    "start-listener": "node diagnostic-listener.mjs",
+    "verify": "tsx verify-routing.ts"
+  },
+  "dependencies": {
+    "ai": "latest",
+    "@ai-sdk/provider": "latest",
+    "@ai-sdk/provider-utils": "latest",
+    "tsx": "latest",
+    "zod": "^3.23.0"
+  }
+}
