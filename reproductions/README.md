@@ -26,10 +26,16 @@ Consequently, the `Promise.all` batch inside `execute-tools-from-stream.ts` neve
 
 1. **Host Stability:** The framework's core stream pipeline and telemetry hooks should never permanently lock due to a stalled downstream dependency.
 2. **Inconsistent Enforcement:** The SDK already uses a defensive `awaitPromiseWithAbortSignal` wrapper inside `parse-tool-call.ts` to protect against hanging model responses. Failing to apply this same pattern to tool execution is a missing architectural guardrail.
-3. **Broken Timeout Contract:** The SDK allows developers to configure a `toolTimeoutMs`, implying the framework will halt the tool if it exceeds this time. Because the timeout is only exposed as a signal rather than an active promise race, the timeout is physically incapable of unblocking the stream if the tool fails to listen for it.
+3. **Broken Timeout Contract (CWE-613):** The SDK explicitly exposes a `toolTimeoutMs` configuration, creating a security contract that the framework will halt execution if the threshold is exceeded. However, because the timeout is passed passively via an options object rather than enforced via a framework-level `Promise.race`, the setting is physically incapable of protecting the host if the developer's HTTP client drops the signal. A framework's internal pipeline stability cannot depend on user-space compliance.
 
 ## Impact
-An unauthenticated attacker can trigger a tool known to query a slow or occasionally unresponsive external API, then immediately close their HTTP connection. By repeating this, the attacker forces the Node.js server to allocate memory and OpenTelemetry contexts that will never be swept. This reliably crashes the host process via Out-Of-Memory (OOM) exhaustion, causing a complete denial of service.
+An unauthenticated attacker can trigger a tool known to query a slow or occasionally unresponsive external API, then immediately close their HTTP connection.
+
+Because the SDK's execution loop permanently hangs, this causes severe cascading failures:
+
+- **Memory Exhaustion (OOM):** OpenTelemetry spans and stream buffers accumulate in the V8 heap until the Node process crashes.
+- **Serverless Concurrency Exhaustion:** In environments like Vercel Serverless Functions or AWS Lambda, the hanging microtask prevents the function invocation from terminating. Attackers can trivially exhaust the victim's maximum concurrent execution limits, taking the entire AI application offline.
+- **Financial Sabotage:** Because the serverless functions hang until the platform's hard maximum timeout (e.g., 5 minutes on Vercel Pro), attackers can inflict massive compute billing spikes on the victim with minimal bandwidth.
 
 ## Steps to Reproduce (PoC)
 1. Initialize a standard Next.js / AI SDK endpoint.
@@ -40,12 +46,14 @@ import { tool, streamText } from 'ai';
 import { z } from 'zod';
 
 const hangingTool = tool({
-  description: 'Queries an external vector database.',
-  parameters: z.object({ query: z.string() }),
-  execute: async ({ query }, { abortSignal }) => {
-    // Simulates an external API that hangs without responding.
-    // The developer forgot to pass `abortSignal` to their fetch client.
-    return new Promise(() => {}); 
+  description: 'Fetches user data from an external CRM.',
+  parameters: z.object({ userId: z.string() }),
+  execute: async ({ userId }) => {
+    // REAL-WORLD MISTAKE: The developer makes a standard fetch call 
+    // but forgets to wire up the { signal: abortSignal } parameter.
+    // We simulate a hanging third-party API using a public delay service.
+    const res = await fetch('https://httpstat.us/200?sleep=60000');
+    return res.json();
   }
 });
 ```
