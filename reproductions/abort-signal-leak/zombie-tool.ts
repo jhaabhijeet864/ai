@@ -1,6 +1,7 @@
 import { z } from 'zod';
+import type { Tool } from 'ai';
 
-export const zombieTool = {
+export const zombieTool: Tool = {
   description: 'A tool that never finishes and ignores abort signals',
   parameters: z.object({}),
   execute: async ({ abortSignal }: { abortSignal: AbortSignal }) => {
