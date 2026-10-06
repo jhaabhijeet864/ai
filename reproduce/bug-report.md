@@ -1,71 +1,54 @@
-# Vulnerability Report: Server-Side Request Forgery (SSRF) in TypeSafe AI Provider
+# Vulnerability Report: Blind Trusted-Origin Redirect Bypass (SSRF) in TypeSafe AI Provider
 
 ## Summary
-**Vulnerability Type:** Server-Side Request Forgery (SSRF) / Unsafe Redirect Following
-**Affected Component:** `packages/typesafe-ai` and `packages/provider-utils`
+**Vulnerability Type:** Server-Side Request Forgery (SSRF) via Unsafe Redirect Following
+**Affected Component:** `packages/provider-utils` (Core Transport) and `packages/typesafe-ai`
 **Severity:** High
 **Status:** Confirmed / Verified via PoC
 
 ### Description
-The TypeSafe AI provider implementation contains a critical security flaw where the `baseURL` configuration is blindly trusted, and the underlying HTTP client blindly follows 3xx redirects. 
+The AI SDK contains a critical systemic risk where the core HTTP transport utility (`postJsonToApi`) blindly follows HTTP 3xx redirects to arbitrary destinations, including internal network addresses. 
 
-This creates two primary attack vectors:
-1. **Direct SSRF**: An attacker can set the `baseURL` to an internal IP (e.g., `http://169.254.169.254`) to target internal services.
-2. **Redirect-Based SSRF**: Even if a trusted `baseURL` is used, the SDK will follow HTTP redirects to arbitrary internal addresses, bypassing initial routing guardrails.
+While the SDK allows for `baseURL` configuration, the primary security failure is that even when a developer configures a completely authentic, trusted base URL (e.g., `https://api.typesafe.ai`), a compromise or open redirect on that trusted gateway allows an attacker to manipulate the SDK into making downstream connections to sensitive internal resources, such as cloud metadata endpoints (`169.254.169.254`). This effectively turns a third-party API vulnerability into an internal network breach of the application server.
 
 ---
 
 ## Technical Deep Dive
 
-### 1. The Vulnerable Path
-
-**Vector A: Unvalidated Initialization**
-In `packages/typesafe-ai/src/typesafe-ai-provider.ts`, the `createTypeSafeAi` factory resolves the `baseURL` without validating the protocol or the destination IP:
-
-```typescript
-const baseURL =
-  withoutTrailingSlash(
-    loadOptionalSetting({
-      settingValue: options.baseURL, // Attacker controlled input
-      environmentVariableName: 'TYPESAFE_AI_BASE_URL',
-    }),
-  ) ?? 'https://api.typesafe.ai/v1';
-```
-
-**Vector B: Blind Redirect Following**
-The `postJsonToApi` utility in `packages/provider-utils/src/post-to-api.ts` calls `fetch` without specifying a `redirect` strategy. According to the Fetch API specification, this defaults to `follow`.
+### 1. The Vulnerable Path: Blind Redirect Following
+The core of the issue resides in `packages/provider-utils/src/post-to-api.ts`. The `postToApi` function (used by `postJsonToApi`) issues requests using `globalThis.fetch` without specifying a `redirect` strategy.
 
 ```typescript
 // packages/provider-utils/src/post-to-api.ts
 const response = await fetch(url, {
   method: 'POST',
-  // 'redirect' is omitted, defaults to 'follow'
+  // 'redirect' is omitted, defaults to 'follow' per Fetch spec
   ...
 });
 ```
 
-This means that if the server at `baseURL` returns a `302 Found` pointing to an internal resource, the SDK will blindly issue a request to that internal resource.
+Per the Fetch API specification, the default behavior is `follow`. This means that if the target server returns a `302 Found` or `303 See Other`, the SDK will automatically issue a new request to the `Location` header provided by the server, without any validation of the destination hostname or IP address.
 
-### 2. Root Cause
-The implementation lacks fundamental security guardrails:
-1. **No Protocol Enforcement**: It does not verify that the URL starts with `https://`.
-2. **No Hostname Validation**: It does not check if the hostname resolves to a private IP (RFC 1918).
-3. **Unsafe HTTP Client Configuration**: It relies on the default `fetch` behavior which follows redirects automatically, whereas it should be using a manual redirect handler that validates each hop.
+### 2. Root Cause: Implementation Oversight
+The most significant finding is that the SDK maintainers have already recognized this risk and implemented a hardened solution elsewhere in the codebase. The utility `fetchWithValidatedRedirects` (in `packages/provider-utils/src/fetch-with-validated-redirects.ts`) was specifically designed to:
+1. Set `redirect: 'manual'`.
+2. Validate every hop using `validateDownloadUrl` to block private/internal IP ranges.
+3. Sanitize headers on cross-origin redirects to prevent credential leakage.
+
+The vulnerability exists because this security wrapper was **not applied** to the core `postJsonToApi` transport used by the TypeSafe AI provider, creating a clear implementation gap between the intended security architecture and the actual code.
 
 ---
 
 ## Proof of Concept (PoC)
 
-### PoC 1: Direct Routing (Localhost)
-By setting `baseURL: 'http://localhost:8090'`, the SDK routes requests directly to an internal service. Verified via `reproduce/verify-routing.ts`.
+### Setup
+The vulnerability was verified using a "Trusted-Origin" simulation:
+1. **Trusted Gateway (`reproduce/redirect-server.mjs`)**: A server (simulating a trusted API endpoint) that returns a `302 Found` redirecting to `http://localhost:8090/systemone`.
+2. **Internal Target (`reproduce/diagnostic-listener.mjs`)**: A listener on port `8090` simulating a sensitive internal service.
+3. **Client (`reproduce/verify-redirect.ts`)**: An SDK instance configured to target the "trusted" gateway.
 
-### PoC 2: Unsafe Redirect Following
-To demonstrate the redirect vulnerability:
-1. **Redirect Server (`reproduce/redirect-server.mjs`)**: Listens on port `8091` and returns a `302 Found` redirecting to `http://localhost:8090/systemone`.
-2. **Exploit Script (`reproduce/verify-redirect.ts`)**: Configures the provider with `baseURL: 'http://localhost:8091'`.
-
-**Execution Results:**
-The diagnostic listener on port `8090` captured the request despite the SDK initially targeting port `8091`.
+### Execution Results
+Despite the client targeting the trusted gateway, the request was successfully routed to the internal target.
 
 ```text
 [REDIRECT] [Redirect Server] Received request for: /systemone
@@ -78,33 +61,34 @@ The diagnostic listener on port `8090` captured the request despite the SDK init
 ========================================================================
 ```
 
+**Note on Request Mutation**: As observed in the logs, the initial `POST` request mutates into a `GET` request upon following the `302` redirect, as mandated by the HTTP specification. While the request body is dropped, the connection handshake still occurs, allowing for internal port scanning and metadata exfiltration.
+
 ---
 
 ## Impact Analysis
 
 ### High-Risk Scenarios
-1. **Cloud Metadata Theft**: An attacker can target `http://169.254.169.254/latest/meta-data/` to steal AWS/GCP instance identity tokens.
-2. **Internal Infrastructure Recon**: An attacker can use the SDK as a proxy to map the internal network of the application server.
-3. **Bypassing WAFs/Guardrails**: If the initial request is made to a trusted domain that allows open redirects, the SDK can be used to attack internal services that are not exposed to the internet.
+1. **Cloud Metadata Exfiltration**: A redirect to `http://169.254.169.254/latest/meta-data/` allows an attacker to steal IAM credentials and instance identity tokens.
+2. **Internal Infrastructure Recon**: The SDK can be used as a proxy to map the internal network (ports, services) of the application server.
+3. **Multi-Tenant Risk**: In platforms where users can provide custom provider configurations, this flaw allows a user to target the platform's own internal infrastructure.
 
 ---
 
 ## Remediation Strategy
 
-### Immediate Fixes
-1. **Enforce HTTPS**: Reject any `baseURL` that does not use `https://`.
-2. **Validate IPs**: Resolve the hostname and verify the IP address is not in a private range.
-3. **Disable Automatic Redirects**: Change `postToApi` to use `redirect: 'manual'`.
-
 ### Recommended Implementation
-The SDK already contains a hardened utility: `fetchWithValidatedRedirects` in `packages/provider-utils/src/fetch-with-validated-redirects.ts`. This utility should be used instead of raw `fetch` in `postToApi`.
+The fix is straightforward: replace the raw `fetch` call in `packages/provider-utils/src/post-to-api.ts` with the existing `fetchWithValidatedRedirects` utility.
 
-**Correct Pattern:**
+**Corrected Pattern:**
 ```typescript
-// Use fetchWithValidatedRedirects to ensure every hop is checked
+import { fetchWithValidatedRedirects } from './fetch-with-validated-redirects';
+
+// Replace raw fetch with the validated wrapper
 const response = await fetchWithValidatedRedirects({
   url,
   headers,
-  // This ensures redirect targets are validated against private IP ranges
+  abortSignal,
+  // This ensures every redirect hop is validated against private IP ranges
 });
 ```
+By leveraging the existing security infrastructure, the SDK can maintain legitimate redirect functionality while blocking internal network exposure.
